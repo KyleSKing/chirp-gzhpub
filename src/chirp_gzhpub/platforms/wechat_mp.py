@@ -1,9 +1,9 @@
-"""WeChat Official Account HTTP client.
+"""WeChat Official Account platform adapter.
 
-Wraps the three endpoints needed for draft publishing:
+Implements the BasePlatform interface against three WeChat endpoints:
   - /cgi-bin/token                          → access_token
-  - /cgi-bin/material/add_material          → image upload (returns media_id + url)
-  - /cgi-bin/draft/add                      → create draft (returns media_id)
+  - /cgi-bin/material/add_material          → image upload (media_id + url)
+  - /cgi-bin/draft/add                      → create draft (media_id)
 
 Token cache: in-memory, 2h, refresh 60s early.
 Error handling: 40001/42001/40014 → re-fetch token and retry once.
@@ -18,16 +18,20 @@ from typing import Any
 
 import requests
 
+from .base import BasePlatform, PlatformError
+
 API_BASE = "https://api.weixin.qq.com/cgi-bin"
-TOKEN_TTL_BUFFER_SEC = 60  # refresh 60s before actual expiry
+TOKEN_TTL_BUFFER_SEC = 60
 DEFAULT_MAX_RETRIES = 3
 
 
-class WeChatError(Exception):
+class WeChatError(PlatformError):
     """Raised when a WeChat API call fails unrecoverably."""
 
 
-class WeChatClient:
+class WeChatPlatform(BasePlatform):
+    name = "wechat_mp"
+
     def __init__(
         self,
         app_id: str,
@@ -47,9 +51,61 @@ class WeChatClient:
         self._token: str | None = None
         self._token_expires_at: float = 0.0
 
+    # --- BasePlatform ---------------------------------------------------------
+
+    def upload_thumb(self, file_path: Path) -> str:
+        file_path = Path(file_path)
+        if not file_path.is_file():
+            raise WeChatError(f"Thumbnail not found: {file_path}")
+        if file_path.stat().st_size > 2 * 1024 * 1024:
+            raise WeChatError(f"Thumbnail too large (>2MB): {file_path}")
+
+        mime = _guess_mime(file_path)
+        with file_path.open("rb") as f:
+            resp = self.session.post(
+                f"{self.base_url}/material/add_material",
+                params={"access_token": self._get_token(), "type": "image"},
+                files={"media": (file_path.name, f, mime)},
+                timeout=60,
+            )
+        data = resp.json()
+        if "media_id" not in data:
+            raise WeChatError(
+                f"Thumbnail upload failed (errcode={data.get('errcode')}): {data.get('errmsg')}"
+            )
+        return data["media_id"]
+
+    def upload_image(self, file_path: Path) -> str:
+        file_path = Path(file_path)
+        if not file_path.is_file():
+            raise WeChatError(f"Image not found: {file_path}")
+        if file_path.stat().st_size > 2 * 1024 * 1024:
+            raise WeChatError(f"Image too large (>2MB): {file_path}")
+
+        mime = _guess_mime(file_path)
+        with file_path.open("rb") as f:
+            resp = self.session.post(
+                f"{self.base_url}/material/add_material",
+                params={"access_token": self._get_token(), "type": "image"},
+                files={"media": (file_path.name, f, mime)},
+                timeout=60,
+            )
+        data = resp.json()
+        if "url" not in data:
+            raise WeChatError(
+                f"Image upload failed (errcode={data.get('errcode')}): {data.get('errmsg')}"
+            )
+        return data["url"]
+
+    def publish_draft(self, article: dict[str, Any]) -> str:
+        data = self._request_json("POST", "/draft/add", json_body={"articles": [article]})
+        if "media_id" not in data:
+            raise WeChatError(f"draft/add returned no media_id: {data}")
+        return data["media_id"]
+
     # --- token ----------------------------------------------------------------
 
-    def get_token(self) -> str:
+    def _get_token(self) -> str:
         now = time.time()
         if self._token and now < self._token_expires_at - TOKEN_TTL_BUFFER_SEC:
             return self._token
@@ -77,67 +133,6 @@ class WeChatClient:
         self._token = None
         self._token_expires_at = 0.0
 
-    # --- upload ---------------------------------------------------------------
-
-    def upload_image(self, file_path: Path) -> str:
-        """Upload an image to the permanent material library.
-
-        Returns the WeChat-hosted URL for use as <img src=...> in article body.
-        Raises WeChatError on failure.
-        """
-        file_path = Path(file_path)
-        if not file_path.is_file():
-            raise WeChatError(f"Image not found: {file_path}")
-        if file_path.stat().st_size > 2 * 1024 * 1024:
-            raise WeChatError(f"Image too large (>2MB): {file_path}")
-
-        mime = _guess_mime(file_path)
-        with file_path.open("rb") as f:
-            resp = self.session.post(
-                f"{self.base_url}/material/add_material",
-                params={"access_token": self.get_token(), "type": "image"},
-                files={"media": (file_path.name, f, mime)},
-                timeout=60,
-            )
-        data = resp.json()
-        if "url" not in data:
-            raise WeChatError(
-                f"Image upload failed (errcode={data.get('errcode')}): {data.get('errmsg')}"
-            )
-        return data["url"]
-
-    def upload_thumb(self, file_path: Path) -> str:
-        """Upload a thumbnail image, return the media_id (used as thumb_media_id)."""
-        file_path = Path(file_path)
-        if not file_path.is_file():
-            raise WeChatError(f"Thumbnail not found: {file_path}")
-        if file_path.stat().st_size > 2 * 1024 * 1024:
-            raise WeChatError(f"Thumbnail too large (>2MB): {file_path}")
-
-        mime = _guess_mime(file_path)
-        with file_path.open("rb") as f:
-            resp = self.session.post(
-                f"{self.base_url}/material/add_material",
-                params={"access_token": self.get_token(), "type": "image"},
-                files={"media": (file_path.name, f, mime)},
-                timeout=60,
-            )
-        data = resp.json()
-        if "media_id" not in data:
-            raise WeChatError(
-                f"Thumbnail upload failed (errcode={data.get('errcode')}): {data.get('errmsg')}"
-            )
-        return data["media_id"]
-
-    # --- draft ----------------------------------------------------------------
-
-    def add_draft(self, article: dict[str, Any]) -> str:
-        """Create a draft article. Returns the new draft media_id."""
-        data = self._request_json("POST", "/draft/add", json_body={"articles": [article]})
-        if "media_id" not in data:
-            raise WeChatError(f"draft/add returned no media_id: {data}")
-        return data["media_id"]
-
     # --- internal -------------------------------------------------------------
 
     def _request_json(
@@ -154,7 +149,7 @@ class WeChatClient:
                 resp = self.session.request(
                     method,
                     f"{self.base_url}{path}",
-                    params={"access_token": self.get_token()},
+                    params={"access_token": self._get_token()},
                     json=json_body,
                     timeout=30,
                 )
@@ -168,16 +163,13 @@ class WeChatClient:
             if errcode in (0, None):
                 return data
 
-            # token expired / invalid → refresh once and retry
             if errcode in (40001, 42001, 40014) and not retried_after_token_refresh:
                 self._invalidate_token()
                 retried_after_token_refresh = True
                 continue
 
-            # rate limit → backoff
             if errcode in (45009, 45002):
-                wait = 2**attempt
-                time.sleep(wait)
+                time.sleep(2**attempt)
                 continue
 
             raise WeChatError(

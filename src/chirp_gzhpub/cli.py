@@ -1,9 +1,8 @@
 """CLI entry point: parse → render → upload assets → create draft.
 
 Usage:
-    chirp --post _posts/2026-08-08-xxx.md           # push to WeChat draft
-    chirp --post _posts/2026-08-08-xxx.md --dry-run  # render only, no API calls
-    chirp --post _posts/2026-08-08-xxx.md --state-file state/x.jsonl
+    chirp --post _posts/2026-08-08-xxx.md --platform wechat_mp
+    chirp --post _posts/2026-08-08-xxx.md --platform wechat_mp --dry-run
 """
 from __future__ import annotations
 
@@ -16,17 +15,10 @@ from typing import Any
 
 from dotenv import load_dotenv
 
-from .client import WeChatClient, WeChatError
 from .parser import parse_post, resolve_asset_path
+from .platforms import AVAILABLE_PLATFORMS, PlatformError, get_platform
 from .renderer import render
 from .state import record
-
-# Ensure UTF-8 output on Windows (GBK default breaks emoji in console).
-for _stream in (sys.stdout, sys.stderr):
-    try:
-        _stream.reconfigure(encoding="utf-8")  # type: ignore[attr-defined]
-    except (AttributeError, ValueError):
-        pass  # Python < 3.7 or already reconfigured; not a hard failure
 
 TITLE_MAX = 64
 DIGEST_MAX = 120
@@ -34,10 +26,18 @@ DIGEST_MAX = 120
 _IMG_SRC_RE = re.compile(r"""<img\s[^>]*?src\s*=\s*['"]([^'"]+)['"][^>]*?>""", re.IGNORECASE)
 
 
+# Ensure UTF-8 output on Windows (GBK default breaks emoji in console).
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8")  # type: ignore[attr-defined]
+    except (AttributeError, ValueError):
+        pass
+
+
 def _build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="chirp",
-        description="Push a Jekyll Markdown post to WeChat Official Account as a draft.",
+        description="Push a Jekyll Markdown post to a publishing platform as a draft.",
     )
     p.add_argument(
         "--post",
@@ -46,9 +46,16 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Path to a Jekyll post .md file.",
     )
     p.add_argument(
+        "--platform",
+        type=str,
+        default="wechat_mp",
+        choices=sorted(AVAILABLE_PLATFORMS),
+        help="Target publishing platform (default: wechat_mp).",
+    )
+    p.add_argument(
         "--dry-run",
         action="store_true",
-        help="Render the post and print a preview. Do not call WeChat API.",
+        help="Render the post and print a preview. Do not call any platform API.",
     )
     p.add_argument(
         "--state-file",
@@ -79,15 +86,10 @@ def main(argv: list[str] | None = None) -> int:
     if not meta.get("wechat"):
         print(f"❌ frontmatter 缺少 wechat: true in {args.post}", file=sys.stderr)
         return 2
-    if "cover" not in meta:
-        print(f"❌ frontmatter 必须有 cover 字段 in {args.post}", file=sys.stderr)
-        return 2
-    if "title_cn" not in meta:
-        print(f"❌ frontmatter 必须有 title_cn 字段 in {args.post}", file=sys.stderr)
-        return 2
-    if "summary_cn" not in meta:
-        print(f"❌ frontmatter 必须有 summary_cn 字段 in {args.post}", file=sys.stderr)
-        return 2
+    for key in ("cover", "title_cn", "summary_cn"):
+        if key not in meta:
+            print(f"❌ frontmatter 必须有 {key} 字段 in {args.post}", file=sys.stderr)
+            return 2
 
     html = render(cn_md)
 
@@ -95,6 +97,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"📄 Frontmatter keys: {sorted(meta.keys())}")
         print(f"📝 title_cn: {meta['title_cn'][:TITLE_MAX]}")
         print(f"📝 cover: {meta['cover']}")
+        print(f"🎯 platform: {args.platform}")
         print("🔍 HTML preview (first 800 chars):")
         print("-" * 60)
         print(html[:800])
@@ -102,26 +105,30 @@ def main(argv: list[str] | None = None) -> int:
         print(f"✅ dry-run complete. {len(html)} chars total.")
         return 0
 
-    app_id = os.environ.get("WECHAT_APP_ID", "")
-    app_secret = os.environ.get("WECHAT_APP_SECRET", "")
-    if not app_id or not app_secret:
-        print("❌ WECHAT_APP_ID / WECHAT_APP_SECRET 未设置。", file=sys.stderr)
-        return 2
+    try:
+        platform = _instantiate_platform(args.platform)
+    except (ValueError, PlatformError) as exc:
+        print(f"❌ {exc}", file=sys.stderr)
+        record(
+            post=str(args.post),
+            media_id=None,
+            title=meta.get("title_cn", ""),
+            status="failed",
+            state_file=args.state_file,
+            error=str(exc),
+        )
+        return 1
 
     try:
-        client = WeChatClient(app_id, app_secret)
-        token = client.get_token()
-        print(f"✅ Token 取得 (len={len(token)})")
-
         cover_path = resolve_asset_path(meta["cover"], args.post.parent)
-        thumb_id = client.upload_thumb(cover_path)
-        print(f"✅ 封面图上传 thumb_media_id={thumb_id}")
+        thumb_id = platform.upload_thumb(cover_path)
+        print(f"✅ 封面图上传 thumb_id={thumb_id}")
 
-        html, image_count = _upload_inline_images(client, html, args.post.parent)
+        html, image_count = _upload_inline_images(platform, html, args.post.parent)
         print(f"✅ 正文图片上传 {image_count} 张")
 
-        article = _build_article(meta, html, thumb_id, args.site_url, args.post)
-        media_id = client.add_draft(article)
+        article = _build_article(meta, html, thumb_id, args.site_url)
+        media_id = platform.publish_draft(article)
         print(f"✅ 草稿创建 media_id={media_id}")
 
         record(
@@ -133,7 +140,7 @@ def main(argv: list[str] | None = None) -> int:
         )
         print(f"📝 状态: {args.state_file}")
         return 0
-    except WeChatError as exc:
+    except PlatformError as exc:
         record(
             post=str(args.post),
             media_id=None,
@@ -142,21 +149,44 @@ def main(argv: list[str] | None = None) -> int:
             state_file=args.state_file,
             error=str(exc),
         )
-        print(f"❌ WeChat API 错误: {exc}", file=sys.stderr)
+        print(f"❌ Platform error: {exc}", file=sys.stderr)
         return 1
     except (FileNotFoundError, ValueError) as exc:
         print(f"❌ {exc}", file=sys.stderr)
         return 2
 
 
+def _instantiate_platform(name: str):
+    """Build a platform instance from env-driven config.
+
+    Each platform reads its own required env vars. For now only wechat_mp is
+    wired up; toutiao raises in its constructor.
+    """
+    if name == "wechat_mp":
+        app_id = os.environ.get("WECHAT_APP_ID", "")
+        app_secret = os.environ.get("WECHAT_APP_SECRET", "")
+        if not app_id or not app_secret:
+            raise PlatformError(
+                "WECHAT_APP_ID / WECHAT_APP_SECRET 未设置。"
+                "Get them from mp.weixin.qq.com → 开发 → 基本配置."
+            )
+        return get_platform(name, app_id=app_id, app_secret=app_secret)
+    # Toutiao and future platforms: just delegate to the factory; the platform
+    # class itself decides what env vars it needs (or raises NotImplementedError).
+    return get_platform(name)
+
+
 def _build_article(
     meta: dict[str, Any],
     html: str,
-    thumb_media_id: str,
+    thumb_id: str,
     site_url: str,
-    post_path: Path,
 ) -> dict[str, Any]:
-    """Build the article dict for the WeChat draft/add API."""
+    """Build the article dict for the WeChat draft/add API.
+
+    Other platforms may need a different shape — extend this function or split
+    per-platform when adding them.
+    """
     author = (
         meta.get("wechat_author")
         or os.environ.get("WECHAT_AUTHOR")
@@ -175,25 +205,24 @@ def _build_article(
         "digest": digest,
         "content": html,
         "content_source_url": source_url,
-        "thumb_media_id": thumb_media_id,
+        "thumb_media_id": thumb_id,
         "need_open_comment": 0,
         "only_fans_can_comment": 0,
     }
 
 
 def _upload_inline_images(
-    client: WeChatClient,
+    platform: Any,
     html: str,
     post_dir: Path,
 ) -> tuple[str, int]:
-    """Find local <img src=...> in HTML, upload each, replace src with WeChat URL.
+    """Find local <img src=...> in HTML, upload each, replace src with platform URL.
 
-    External URLs (http://, https://, //) are left as-is and will be replaced by
-    WeChat's anti-leech proxy (mmbiz.qpic.cn) on display — not ideal but acceptable
-    for v1. Local relative paths are uploaded and replaced.
+    External URLs (http://, https://, //) are left as-is. Local relative paths
+    are uploaded and replaced.
     """
     count = 0
-    seen: dict[str, str] = {}  # local path → WeChat URL (dedupe)
+    seen: dict[str, str] = {}  # local path → platform URL (dedupe)
 
     def repl(m: re.Match[str]) -> str:
         nonlocal count
@@ -206,7 +235,7 @@ def _upload_inline_images(
             return m.group(0)
         if str(local_path) in seen:
             return m.group(0).replace(src, seen[str(local_path)])
-        url = client.upload_image(local_path)
+        url = platform.upload_image(local_path)
         seen[str(local_path)] = url
         count += 1
         return m.group(0).replace(src, url)

@@ -134,6 +134,7 @@ After success, find the article in mp.weixin.qq.com → 草稿箱. **Preview on 
 
 ```bash
 chirp --post PATH \
+      --platform {wechat_mp,toutiao} \
       [--dry-run] \
       [--state-file state/wechat_publishes.jsonl] \
       [--site-url https://example.com]
@@ -178,52 +179,60 @@ All HTTP calls are mocked via `unittest.mock` — no live API calls.
 
 ---
 
-## 多账号 / 多平台开发模式 / Multi-account / multi-platform workflow
+## 多平台架构 / Multi-platform architecture
 
-**每个发布账号（公众号 / 头条号 / 掘金 / 知乎 / ...）对应一个 git worktree + 一个 `platform/<name>` 分支。**
+**单分支 + `platforms/` 模块目录**。每个发布平台（公众号 / 头条号 / 掘金 / 知乎 / ...）对应一个 `src/chirp_gzhpub/platforms/<name>.py` 文件，实现统一接口 `BasePlatform`。共享代码（parser / renderer / state / styles）一处改、所有平台受益。
 
-Each publishing account (WeChat MP / Toutiao / Juejin / Zhihu / ...) maps to a git worktree on a `platform/<name>` branch.
+**Single branch + `platforms/` package.** Each platform (WeChat MP / Toutiao / Juejin / Zhihu / ...) is one file under `src/chirp_gzhpub/platforms/<name>.py` implementing the `BasePlatform` interface. Shared code (parser / renderer / state / styles) lives once; fixes propagate to all platforms.
 
 ```
-chirp-gzhpub/                ← main worktree,   branch: main,           platform: wechat_mp
-chirp-toutiao/               ← sibling worktree, branch: platform/toutiao
-chirp-juejin/                ← future
-chirp-zhihu/                 ← future
-...
+src/chirp_gzhpub/
+├── cli.py                       # dispatch by --platform flag
+├── parser.py                    # shared
+├── renderer.py                  # shared
+├── state.py                     # shared
+├── styles.py                    # shared
+└── platforms/
+    ├── base.py                  # abstract BasePlatform + PlatformError
+    ├── wechat_mp.py             # WeChat 公众号 (草稿 API)
+    └── toutiao.py               # 头条号 (placeholder, phase 2)
 ```
 
-共享代码在 `main` 上（parser / renderer / state / styles / CLI 调度），平台特化代码在各自 worktree 里加 `src/chirp_gzhpub/platforms/<name>.py`，完成后合并回 `main`。
-
-Shared code (parser / renderer / state / styles / CLI dispatcher) lives on `main`. Platform-specific code is added in each worktree under `src/chirp_gzhpub/platforms/<name>.py` and merged back when ready.
-
-### 加一个新平台的步骤 / Adding a new platform
+### 加一个新平台 / Adding a new platform
 
 ```bash
-# 1. 在 main worktree 里：从 main 拉新分支 + 创建 sibling worktree
-cd chirp-gzhpub
-git worktree add -b platform/<name> ../chirp-<name> main
+# 1. 用一个临时 feature 分支（**不是**永久平台分支）
+git switch -c feat/platform-<name>
 
-# 2. 切到新 worktree 开发
-cd ../chirp-<name>
-# 编辑 src/chirp_gzhpub/platforms/<name>.py + tests/test_platform_<name>.py
+# 2. 写适配器：继承 BasePlatform，实现 upload_thumb / upload_image / publish_draft
+$EDITOR src/chirp_gzhpub/platforms/<name>.py
+$EDITOR tests/test_platforms_<name>.py
+
+# 3. 在 platforms/__init__.py 注册
+$EDITOR src/chirp_gzhpub/platforms/__init__.py
+#   - import <Name>Platform
+#   - 加进 AVAILABLE_PLATFORMS dict
+
+# 4. 跑测试
 pytest -v
-git add . && git commit -m "feat(<name>): add <name> platform adapter"
+ruff check src tests
 
-# 3. 合并回 main
-cd ../chirp-gzhpub
-git merge platform/<name> --no-ff
+# 5. 合并回 main + 删临时分支
+git switch main
+git merge --no-ff feat/platform-<name>
+git branch -d feat/platform-<name>
 ```
 
-### 当前 worktree / Current worktrees
+`--platform` 标志会自动列出已注册平台（`chirp --help` 可见）。
 
-| Worktree | Branch | Platform | 状态 / Status |
-|---|---|---|---|
-| `chirp-gzhpub/` | `main` | wechat_mp | ✅ 阶段 1 完成 / Phase 1 done |
-| `chirp-toutiao/` | `platform/toutiao` | toutiao | ⏳ 待开发 / TBD |
+The `--platform` flag auto-lists registered platforms (visible in `chirp --help`).
 
-查看：`git worktree list`（在任一 worktree 内执行）
+### 当前已注册平台 / Registered platforms
 
-Run `git worktree list` from any worktree to verify.
+| Platform | 状态 / Status | 说明 / Notes |
+|---|---|---|
+| `wechat_mp` | ✅ 完成 / done | 公众号草稿 API，OAuth + multipart upload |
+| `toutiao` | ⏳ 占位 / placeholder | 阶段 2: Playwright + 头条号后台浏览器自动化 |
 
 ---
 
@@ -241,13 +250,18 @@ chirp-gzhpub/
 │   ├── cli.py          # argparse + 编排 / orchestration
 │   ├── parser.py       # Jekyll post → (frontmatter, cn_md)
 │   ├── renderer.py     # MD → HTML + inline CSS
-│   ├── client.py       # WeChat HTTP client (token 缓存 + 重试 / cache + retry)
 │   ├── state.py        # JSONL 状态日志 / state log
-│   └── styles.py       # INLINE_STYLES 常量 / constants
+│   ├── styles.py       # INLINE_STYLES 常量 / constants
+│   └── platforms/      # 一文件一平台 / one file per platform
+│       ├── __init__.py # factory + AVAILABLE_PLATFORMS
+│       ├── base.py     # BasePlatform + PlatformError
+│       ├── wechat_mp.py
+│       └── toutiao.py
 ├── tests/
 │   ├── test_parser.py
 │   ├── test_renderer.py
-│   ├── test_client.py
+│   ├── test_platforms.py            # factory + base tests
+│   ├── test_platforms_wechat_mp.py  # WeChat-specific (mocked HTTP)
 │   └── fixtures/sample_post.md
 ├── .github/workflows/ci.yml
 └── state/              # 运行时生成，gitignore / runtime, gitignored
