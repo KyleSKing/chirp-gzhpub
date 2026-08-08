@@ -178,6 +178,55 @@ All HTTP calls are mocked via `unittest.mock` — no live API calls.
 
 ---
 
+## 多账号 / 多平台开发模式 / Multi-account / multi-platform workflow
+
+**每个发布账号（公众号 / 头条号 / 掘金 / 知乎 / ...）对应一个 git worktree + 一个 `platform/<name>` 分支。**
+
+Each publishing account (WeChat MP / Toutiao / Juejin / Zhihu / ...) maps to a git worktree on a `platform/<name>` branch.
+
+```
+chirp-gzhpub/                ← main worktree,   branch: main,           platform: wechat_mp
+chirp-toutiao/               ← sibling worktree, branch: platform/toutiao
+chirp-juejin/                ← future
+chirp-zhihu/                 ← future
+...
+```
+
+共享代码在 `main` 上（parser / renderer / state / styles / CLI 调度），平台特化代码在各自 worktree 里加 `src/chirp_gzhpub/platforms/<name>.py`，完成后合并回 `main`。
+
+Shared code (parser / renderer / state / styles / CLI dispatcher) lives on `main`. Platform-specific code is added in each worktree under `src/chirp_gzhpub/platforms/<name>.py` and merged back when ready.
+
+### 加一个新平台的步骤 / Adding a new platform
+
+```bash
+# 1. 在 main worktree 里：从 main 拉新分支 + 创建 sibling worktree
+cd chirp-gzhpub
+git worktree add -b platform/<name> ../chirp-<name> main
+
+# 2. 切到新 worktree 开发
+cd ../chirp-<name>
+# 编辑 src/chirp_gzhpub/platforms/<name>.py + tests/test_platform_<name>.py
+pytest -v
+git add . && git commit -m "feat(<name>): add <name> platform adapter"
+
+# 3. 合并回 main
+cd ../chirp-gzhpub
+git merge platform/<name> --no-ff
+```
+
+### 当前 worktree / Current worktrees
+
+| Worktree | Branch | Platform | 状态 / Status |
+|---|---|---|---|
+| `chirp-gzhpub/` | `main` | wechat_mp | ✅ 阶段 1 完成 / Phase 1 done |
+| `chirp-toutiao/` | `platform/toutiao` | toutiao | ⏳ 待开发 / TBD |
+
+查看：`git worktree list`（在任一 worktree 内执行）
+
+Run `git worktree list` from any worktree to verify.
+
+---
+
 ## 项目结构 / Project structure
 
 ```
