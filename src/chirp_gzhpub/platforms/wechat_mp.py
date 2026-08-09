@@ -18,6 +18,7 @@ from typing import Any
 
 import requests
 
+from ..image_compress import ImageCompressionError, compress_for_upload
 from .base import BasePlatform, PlatformError
 
 API_BASE = "https://api.weixin.qq.com/cgi-bin"
@@ -57,45 +58,51 @@ class WeChatPlatform(BasePlatform):
         file_path = Path(file_path)
         if not file_path.is_file():
             raise WeChatError(f"Thumbnail not found: {file_path}")
-        if file_path.stat().st_size > 2 * 1024 * 1024:
-            raise WeChatError(f"Thumbnail too large (>2MB): {file_path}")
 
-        mime = _guess_mime(file_path)
-        with file_path.open("rb") as f:
-            resp = self.session.post(
-                f"{self.base_url}/material/add_material",
-                params={"access_token": self._get_token(), "type": "image"},
-                files={"media": (file_path.name, f, mime)},
-                timeout=60,
-            )
-        data = resp.json()
-        if "media_id" not in data:
-            raise WeChatError(
-                f"Thumbnail upload failed (errcode={data.get('errcode')}): {data.get('errmsg')}"
-            )
-        return data["media_id"]
+        upload_path, needs_cleanup = self._prepare_for_upload(file_path)
+        try:
+            mime = _guess_mime(upload_path)
+            with upload_path.open("rb") as f:
+                resp = self.session.post(
+                    f"{self.base_url}/material/add_material",
+                    params={"access_token": self._get_token(), "type": "image"},
+                    files={"media": (file_path.name, f, mime)},
+                    timeout=60,
+                )
+            data = resp.json()
+            if "media_id" not in data:
+                raise WeChatError(
+                    f"Thumbnail upload failed (errcode={data.get('errcode')}): {data.get('errmsg')}"
+                )
+            return data["media_id"]
+        finally:
+            if needs_cleanup:
+                upload_path.unlink(missing_ok=True)
 
     def upload_image(self, file_path: Path) -> str:
         file_path = Path(file_path)
         if not file_path.is_file():
             raise WeChatError(f"Image not found: {file_path}")
-        if file_path.stat().st_size > 2 * 1024 * 1024:
-            raise WeChatError(f"Image too large (>2MB): {file_path}")
 
-        mime = _guess_mime(file_path)
-        with file_path.open("rb") as f:
-            resp = self.session.post(
-                f"{self.base_url}/material/add_material",
-                params={"access_token": self._get_token(), "type": "image"},
-                files={"media": (file_path.name, f, mime)},
-                timeout=60,
-            )
-        data = resp.json()
-        if "url" not in data:
-            raise WeChatError(
-                f"Image upload failed (errcode={data.get('errcode')}): {data.get('errmsg')}"
-            )
-        return data["url"]
+        upload_path, needs_cleanup = self._prepare_for_upload(file_path)
+        try:
+            mime = _guess_mime(upload_path)
+            with upload_path.open("rb") as f:
+                resp = self.session.post(
+                    f"{self.base_url}/material/add_material",
+                    params={"access_token": self._get_token(), "type": "image"},
+                    files={"media": (file_path.name, f, mime)},
+                    timeout=60,
+                )
+            data = resp.json()
+            if "url" not in data:
+                raise WeChatError(
+                    f"Image upload failed (errcode={data.get('errcode')}): {data.get('errmsg')}"
+                )
+            return data["url"]
+        finally:
+            if needs_cleanup:
+                upload_path.unlink(missing_ok=True)
 
     def publish_draft(self, article: dict[str, Any]) -> str:
         data = self._request_json("POST", "/draft/add", json_body={"articles": [article]})
@@ -132,6 +139,14 @@ class WeChatPlatform(BasePlatform):
     def _invalidate_token(self) -> None:
         self._token = None
         self._token_expires_at = 0.0
+
+    def _prepare_for_upload(self, file_path: Path) -> tuple[Path, bool]:
+        """Compress `file_path` if needed; return (upload_path, needs_cleanup)."""
+        try:
+            upload_path = compress_for_upload(file_path)
+        except ImageCompressionError as exc:
+            raise WeChatError(f"Cannot upload {file_path.name}: {exc}") from exc
+        return upload_path, upload_path != file_path
 
     # --- internal -------------------------------------------------------------
 

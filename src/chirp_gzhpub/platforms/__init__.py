@@ -14,12 +14,10 @@ from __future__ import annotations
 from typing import Any
 
 from .base import BasePlatform, PlatformError
-from .toutiao import ToutiaoNotImplementedError, ToutiaoPlatform
 from .wechat_mp import WeChatError, WeChatPlatform
 
 AVAILABLE_PLATFORMS: dict[str, type[BasePlatform]] = {
     "wechat_mp": WeChatPlatform,
-    "toutiao": ToutiaoPlatform,  # present but raises on construction
 }
 
 
@@ -28,7 +26,6 @@ def get_platform(name: str, **kwargs: Any) -> BasePlatform:
 
     Raises:
         ValueError: unknown platform name.
-        PlatformError (or subclass): platform is registered but not implemented yet.
     """
     cls = AVAILABLE_PLATFORMS.get(name)
     if cls is None:
@@ -41,8 +38,6 @@ __all__ = [
     "AVAILABLE_PLATFORMS",
     "BasePlatform",
     "PlatformError",
-    "ToutiaoNotImplementedError",
-    "ToutiaoPlatform",
     "WeChatError",
     "WeChatPlatform",
     "get_platform",

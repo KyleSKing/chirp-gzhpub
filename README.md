@@ -119,12 +119,13 @@ chirp --post _posts/2026-08-08-xxx.md
 
 执行流程 / Pipeline:
 
-1. 读 post → 抽出 frontmatter + 中文 body / Read post → extract frontmatter + Chinese body
-2. Markdown → HTML（带行内 CSS，WeChat 可识别）/ Markdown → HTML with inline CSS
-3. 上传封面图 → 拿 `thumb_media_id` / Upload cover → get `thumb_media_id`
-4. 上传正文图片（本地相对路径）→ 替换为 WeChat CDN URL / Upload inline images → replace with WeChat CDN URLs
-5. 创建草稿 → 拿 `media_id` / Create draft → get `media_id`
-6. 追加一行到 `state/wechat_publishes.jsonl` / Append a line to the state log
+1. **幂等性检查** / **Idempotency check**: 读 `state/wechat_publishes.jsonl`，如果最近的记录是 `drafted` 成功状态则跳过（除非加 `--force`）。失败记录总是重试。 / Read state log; skip if the last entry is a successful `draft` (unless `--force`). Failed posts are always retried.
+2. 读 post → 抽出 frontmatter + 中文 body / Read post → extract frontmatter + Chinese body
+3. Markdown → HTML（带行内 CSS，WeChat 可识别）/ Markdown → HTML with inline CSS
+4. 上传封面图 → 拿 `thumb_media_id` / Upload cover → get `thumb_media_id`（自动压缩到 < 1.8MB / auto-compress to < 1.8MB）
+5. 上传正文图片（本地相对路径）→ 替换为 WeChat CDN URL / Upload inline images → replace with WeChat CDN URLs
+6. 创建草稿 → 拿 `media_id` / Create draft → get `media_id`
+7. 追加一行到 `state/wechat_publishes.jsonl` / Append a line to the state log
 
 成功后在 mp.weixin.qq.com → 草稿箱 看到该文，手机端预览样式。
 
@@ -134,10 +135,12 @@ After success, find the article in mp.weixin.qq.com → 草稿箱. **Preview on 
 
 ```bash
 chirp --post PATH \
-      --platform {wechat_mp,toutiao} \
+      --platform {wechat_mp} \
       [--dry-run] \
       [--state-file state/wechat_publishes.jsonl] \
-      [--site-url https://example.com]
+      [--site-url https://example.com] \
+      [--force]                  # 跳过幂等性检查，重推已成功的草稿
+      [--auto-cover]            # 自动生成封面图（浅色简约模板），不再要求 frontmatter cover
 ```
 
 ---
@@ -172,8 +175,8 @@ All HTTP calls are mocked via `unittest.mock` — no live API calls.
 ## 已知限制 / Known limitations
 
 - **不做直发**：只进草稿箱，由人审核后群发 / **No direct publish**: drafts only, human reviews and sends
-- **不做自动生成封面图**：作者必须显式提供 / **No auto-generated cover**: author must provide one
-- **不做图片压缩**：原图上传，超过 2MB 报错 / **No image compression**: uploads as-is, fails if > 2MB
+- **不做图片压缩（已解）**：原图超 2MB 时 `image_compress.py` 自动压到 < 1.8MB（JPG/PNG/WebP；GIF 跳过）。详见 [src/chirp_gzhpub/image_compress.py](src/chirp_gzhpub/image_compress.py)。
+- **不做自动生成封面图（已解，需 `--auto-cover`）**：开启后用 Pillow 渲染浅色简约模板（白底 + 红色左条 + 黑色标题 + 品牌页脚）。需要系统装 CJK 字体（Windows msyh.ttc、macOS PingFang、Linux `fonts-noto-cjk`），否则 `FileNotFoundError` 提示安装命令。
 - **外链图片不过 WeChat 防盗链**：本地图片才上传替换；外链保留，由 WeChat 显示时换为 `mmbiz.qpic.cn` 代理 / **External image URLs are not WeChat-CDN'd**: only local images get uploaded; external URLs stay and WeChat will proxy them through `mmbiz.qpic.cn` on display
 - **CI 自动发布不在 v1 范围**：GitHub Actions IP 段会变，会破坏 IP 白名单 / **No CI auto-publish in v1**: GitHub Actions IPs rotate, which breaks the IP whitelist. A self-hosted runner can be added later.
 
@@ -250,13 +253,14 @@ chirp-gzhpub/
 │   ├── cli.py          # argparse + 编排 / orchestration
 │   ├── parser.py       # Jekyll post → (frontmatter, cn_md)
 │   ├── renderer.py     # MD → HTML + inline CSS
-│   ├── state.py        # JSONL 状态日志 / state log
+│   ├── state.py        # JSONL 状态日志 + 幂等性决策
 │   ├── styles.py       # INLINE_STYLES 常量 / constants
+│   ├── image_compress.py # >2MB 图片自动压缩
+│   ├── cover_gen.py    # 浅色简约封面自动生成（需 --auto-cover）
 │   └── platforms/      # 一文件一平台 / one file per platform
 │       ├── __init__.py # factory + AVAILABLE_PLATFORMS
 │       ├── base.py     # BasePlatform + PlatformError
-│       ├── wechat_mp.py
-│       └── toutiao.py
+│       └── wechat_mp.py
 ├── tests/
 │   ├── test_parser.py
 │   ├── test_renderer.py
@@ -271,8 +275,7 @@ chirp-gzhpub/
 
 ## 阶段 1 不做的事（留给后续）/ Out of scope for phase 1
 
-- 头条号、百家号、掘金、知乎适配器 / Toutiao / Baijia / Juejin / Zhihu adapters
-- 自动重试失败的草稿 / Auto-retry failed drafts
+- 头条号、百家号、掘金、知乎适配器 / Toutiao / Baijia / Juejin / Zhihu adapters（**2026-08-09 Toutiao 已从 CLI 摘除**）
 - 集成进 `ai-infosec-landing` 的 GitHub Actions / Wire into ai-infosec-landing CI
 - 批量发布 / 定时发布 / Batch / scheduled publishing
 - Web UI

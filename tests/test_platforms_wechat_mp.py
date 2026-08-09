@@ -6,9 +6,16 @@ from unittest.mock import MagicMock
 
 import pytest
 import requests
+from PIL import Image
 
 from chirp_gzhpub.platforms.base import PlatformError
 from chirp_gzhpub.platforms.wechat_mp import WeChatError, WeChatPlatform
+
+
+def _real_png(path: Path, width: int = 10, height: int = 10) -> Path:
+    """Write a real, decodable PNG (compression code opens it with Pillow)."""
+    Image.new("RGB", (width, height), "red").save(path, format="PNG")
+    return path
 
 
 def _mock_response(json_data: dict, status_code: int = 200) -> MagicMock:
@@ -65,8 +72,7 @@ def test_get_token_refreshes_after_expiry() -> None:
 
 
 def test_upload_thumb_returns_media_id(tmp_path: Path) -> None:
-    img = tmp_path / "cover.png"
-    img.write_bytes(b"\x89PNG\r\n\x1a\n" + b"x" * 100)
+    img = _real_png(tmp_path / "cover.png")
     session = MagicMock()
     session.get.return_value = _mock_response(
         {"access_token": "tk", "expires_in": 7200}
@@ -84,17 +90,17 @@ def test_upload_thumb_rejects_missing_file(tmp_path: Path) -> None:
         platform.upload_thumb(tmp_path / "missing.png")
 
 
-def test_upload_thumb_rejects_oversized(tmp_path: Path) -> None:
+def test_upload_thumb_rejects_undecodable_oversized(tmp_path: Path) -> None:
+    """A >2MB file that Pillow can't decode surfaces as a WeChatError."""
     big = tmp_path / "big.jpg"
     big.write_bytes(b"x" * (3 * 1024 * 1024))
     platform = WeChatPlatform("id", "secret", session=MagicMock())
-    with pytest.raises(WeChatError, match="too large"):
+    with pytest.raises(WeChatError, match="Cannot upload"):
         platform.upload_thumb(big)
 
 
 def test_upload_image_returns_url(tmp_path: Path) -> None:
-    img = tmp_path / "img.png"
-    img.write_bytes(b"\x89PNG\r\n\x1a\n" + b"x" * 100)
+    img = _real_png(tmp_path / "img.png")
     session = MagicMock()
     session.get.return_value = _mock_response(
         {"access_token": "tk", "expires_in": 7200}

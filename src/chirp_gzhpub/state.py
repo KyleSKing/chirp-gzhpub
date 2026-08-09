@@ -57,3 +57,39 @@ def last_publish_for(post: str, state_file: Path = DEFAULT_STATE_FILE) -> dict[s
             if entry.get("post") == post:
                 last = entry
     return last
+
+
+def decide_publish(
+    post: str,
+    state_file: Path = DEFAULT_STATE_FILE,
+    *,
+    force: bool = False,
+) -> tuple[bool, str]:
+    """Decide whether to publish `post` given its history in `state_file`.
+
+    Returns (should_publish, reason):
+      - (True, "...")  — proceed with publish
+      - (False, "...") — skip, do not publish
+
+    Rules:
+      - No prior record        → publish.
+      - Last entry is "failed" → publish (allows retry by default).
+      - Last entry is "drafted":
+          - force=True  → publish (explicit republish).
+          - force=False → skip, surface the prior media_id + timestamp.
+      - Any other status       → publish (don't silently swallow unknowns).
+    """
+    last = last_publish_for(post, state_file)
+    if last is None:
+        return True, "no prior publish record"
+    status = last.get("status")
+    if status == "failed":
+        return True, f"retrying previous failure: {last.get('error', '')}"
+    if status == "drafted":
+        if force:
+            return True, "force republish (overriding prior draft)"
+        return False, (
+            f"already drafted at {last.get('timestamp')} "
+            f"(media_id={last.get('media_id')}); use --force to republish"
+        )
+    return True, f"unknown prior status {status!r}, defaulting to publish"

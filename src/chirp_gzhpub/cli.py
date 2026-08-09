@@ -10,15 +10,17 @@ import argparse
 import os
 import re
 import sys
+import tempfile
 from pathlib import Path
 from typing import Any
 
 from dotenv import load_dotenv
 
+from . import cover_gen
 from .parser import parse_post, resolve_asset_path
 from .platforms import AVAILABLE_PLATFORMS, PlatformError, get_platform
 from .renderer import render
-from .state import record
+from .state import decide_publish, record
 
 TITLE_MAX = 64
 DIGEST_MAX = 120
@@ -70,6 +72,19 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Base URL of the source site (for content_source_url). "
         "Defaults to $SITE_URL env var.",
     )
+    p.add_argument(
+        "--force",
+        action="store_true",
+        help="Republish even if state log shows a prior successful draft "
+        "(otherwise skipped). Failed posts are always retried by default.",
+    )
+    p.add_argument(
+        "--auto-cover",
+        action="store_true",
+        help="Generate a cover image automatically (Pillow, light-minimal style) "
+        "instead of requiring a `cover:` field in frontmatter. "
+        "Ignores the frontmatter `cover:` value when set.",
+    )
     return p
 
 
@@ -86,10 +101,17 @@ def main(argv: list[str] | None = None) -> int:
     if not meta.get("wechat"):
         print(f"❌ frontmatter 缺少 wechat: true in {args.post}", file=sys.stderr)
         return 2
-    for key in ("cover", "title_cn", "summary_cn"):
+    for key in ("title_cn", "summary_cn"):
         if key not in meta:
             print(f"❌ frontmatter 必须有 {key} 字段 in {args.post}", file=sys.stderr)
             return 2
+    if not args.auto_cover and "cover" not in meta:
+        print(
+            f"❌ frontmatter 必须有 cover 字段 in {args.post} "
+            "(or pass --auto-cover to generate one)",
+            file=sys.stderr,
+        )
+        return 2
 
     html = render(cn_md)
 
@@ -104,6 +126,31 @@ def main(argv: list[str] | None = None) -> int:
         print("-" * 60)
         print(f"✅ dry-run complete. {len(html)} chars total.")
         return 0
+
+    # Idempotency: skip if a prior successful draft exists (unless --force).
+    # Failed posts are always retried; never-published posts always proceed.
+    should_publish, reason = decide_publish(
+        str(args.post), args.state_file, force=args.force
+    )
+    print(f"🔍 {reason}")
+    if not should_publish:
+        print(f"⏭️  skip: {args.post}")
+        return 0
+
+    # Cover: either auto-generate or use the user-supplied path. We resolve
+    # this before platform instantiation so a missing CJK font doesn't waste
+    # an access_token.
+    cover_path: Path
+    cover_cleanup: Path | None = None
+    if args.auto_cover:
+        try:
+            cover_path = _auto_generate_cover(meta)
+        except FileNotFoundError as exc:
+            print(f"❌ {exc}", file=sys.stderr)
+            return 2
+        cover_cleanup = cover_path
+    else:
+        cover_path = resolve_asset_path(meta["cover"], args.post.parent)
 
     try:
         platform = _instantiate_platform(args.platform)
@@ -120,7 +167,6 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     try:
-        cover_path = resolve_asset_path(meta["cover"], args.post.parent)
         thumb_id = platform.upload_thumb(cover_path)
         print(f"✅ 封面图上传 thumb_id={thumb_id}")
 
@@ -154,6 +200,9 @@ def main(argv: list[str] | None = None) -> int:
     except (FileNotFoundError, ValueError) as exc:
         print(f"❌ {exc}", file=sys.stderr)
         return 2
+    finally:
+        if cover_cleanup and cover_cleanup.exists():
+            cover_cleanup.unlink(missing_ok=True)
 
 
 def _instantiate_platform(name: str):
@@ -174,6 +223,29 @@ def _instantiate_platform(name: str):
     # Toutiao and future platforms: just delegate to the factory; the platform
     # class itself decides what env vars it needs (or raises NotImplementedError).
     return get_platform(name)
+
+
+def _auto_generate_cover(meta: dict[str, Any]) -> Path:
+    """Render a light-minimal cover to a temp file; caller is responsible for cleanup.
+
+    Brand follows the same precedence as the article author: frontmatter
+    wechat_author > WECHAT_AUTHOR env > "AI 安全情报".
+    """
+    brand = (
+        meta.get("wechat_author")
+        or os.environ.get("WECHAT_AUTHOR")
+        or "AI 安全情报"
+    )
+    fd, name = tempfile.mkstemp(suffix=".png", prefix="chirp_cover_")
+    os.close(fd)
+    cover_path = Path(name)
+    cover_gen.generate_cover(
+        title=meta.get("title_cn", ""),
+        brand=brand,
+        output_path=cover_path,
+    )
+    print(f"🎨 auto-generated cover: {cover_path}")
+    return cover_path
 
 
 def _build_article(
